@@ -1,0 +1,15 @@
+{
+  "name": "zrustc/codex_moonbit",
+  "version": "0.1.0",
+  "deps": {
+    "moonbitlang/x": "0.4.40",
+    "sennenki/process": "0.1.0",
+    "tonyfettes/os": "0.1.0"
+  },
+  "readme": "README.mbt.md",
+  "repository": "https://github.com/zrustc/codex-moonbit",
+  "license": "Apache-2.0",
+  "keywords": ["codex", "agent", "moonbit"],
+  "description": "MoonBit reimplementation of Codex CLI",
+  "preferred-target": "native"
+}

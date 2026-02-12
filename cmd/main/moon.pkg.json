@@ -1,0 +1,9 @@
+{
+  "is-main": true,
+  "import": [
+    {
+      "path": "zrustc/codex_moonbit",
+      "alias": "codex"
+    }
+  ]
+}

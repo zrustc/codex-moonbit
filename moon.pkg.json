@@ -1,0 +1,12 @@
+{
+  "import": [
+    "moonbitlang/x/sys",
+    "moonbitlang/x/fs",
+    "sennenki/process",
+    "tonyfettes/os",
+    "moonbitlang/core/env",
+    "moonbitlang/core/json",
+    "moonbitlang/core/strconv",
+    "moonbitlang/core/encoding/utf8"
+  ]
+}
