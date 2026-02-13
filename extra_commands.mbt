@@ -134,6 +134,15 @@ fn describe_mcp_entry(entry : Json) -> String {
 }
 
 ///|
+fn load_mcp_token(name : String) -> String? {
+  let tokens = load_named_config_object("mcp_tokens")
+  match tokens.get(name) {
+    Some(String(value)) => normalize_non_empty(Some(value))
+    _ => None
+  }
+}
+
+///|
 fn is_valid_server_name(name : String) -> Bool {
   if name == "" {
     return false
@@ -152,8 +161,12 @@ fn is_valid_server_name(name : String) -> Bool {
 ///|
 fn run_mcp_list_command(options : RunOptions) -> Unit {
   let servers = load_named_config_object("mcp_servers")
+  let tokens = load_named_config_object("mcp_tokens")
   if options.json_mode {
-    let payload : Json = { "servers": Json::object(servers) }
+    let payload : Json = {
+      "servers": Json::object(servers),
+      "mcp_tokens": Json::object(tokens),
+    }
     println(payload.stringify(indent=2))
     return
   }
@@ -162,7 +175,12 @@ fn run_mcp_list_command(options : RunOptions) -> Unit {
     return
   }
   for name, entry in servers {
-    println("\{name}\t\{describe_mcp_entry(entry)}")
+    let auth_state = if load_mcp_token(name) is Some(_) {
+      "logged-in"
+    } else {
+      "logged-out"
+    }
+    println("\{name}\t\{describe_mcp_entry(entry)}\t\{auth_state}")
   }
 }
 
@@ -173,12 +191,19 @@ fn run_mcp_get_command(name : String, options : RunOptions) -> Unit {
     Some(value) => value
     None => fatal("MCP server not found: \{name}")
   }
+  let logged_in = load_mcp_token(name) is Some(_)
   if options.json_mode {
-    let payload : Json = { "name": name, "server": entry }
+    let payload : Json = {
+      "name": name,
+      "server": entry,
+      "logged_in": logged_in,
+    }
     println(payload.stringify(indent=2))
   } else {
     println("Name: \{name}")
     println("Config: \{describe_mcp_entry(entry)}")
+    let auth_state = if logged_in { "logged-in" } else { "logged-out" }
+    println("Auth: \{auth_state}")
   }
 }
 
@@ -226,11 +251,60 @@ fn run_mcp_remove_command(name : String, options : RunOptions) -> Unit {
   }
   servers.remove(name)
   save_named_config_object("mcp_servers", servers)
+  let tokens = load_named_config_object("mcp_tokens")
+  if tokens.contains(name) {
+    tokens.remove(name)
+    save_named_config_object("mcp_tokens", tokens)
+  }
   if options.json_mode {
     let payload : Json = { "success": true, "name": name }
     println(payload.stringify(indent=2))
   } else {
     println("Removed MCP server '\{name}'.")
+  }
+}
+
+///|
+fn run_mcp_login_command(
+  name : String,
+  token : String?,
+  options : RunOptions,
+) -> Unit {
+  let servers = load_named_config_object("mcp_servers")
+  if !servers.contains(name) {
+    fatal("MCP server not found: \{name}")
+  }
+  let resolved_token = match normalize_non_empty(token) {
+    Some(value) => Some(value)
+    None => normalize_non_empty(@sys.get_env_var("MCP_TOKEN"))
+  }
+  let access_token = match resolved_token {
+    Some(value) => value
+    None => fatal("missing MCP token. Use --token <TOKEN> or set MCP_TOKEN")
+  }
+  let tokens = load_named_config_object("mcp_tokens")
+  tokens.set(name, Json::string(access_token))
+  save_named_config_object("mcp_tokens", tokens)
+  if options.json_mode {
+    let payload : Json = { "success": true, "name": name, "logged_in": true }
+    println(payload.stringify(indent=2))
+  } else {
+    println("MCP server '\{name}' logged in.")
+  }
+}
+
+///|
+fn run_mcp_logout_command(name : String, options : RunOptions) -> Unit {
+  let tokens = load_named_config_object("mcp_tokens")
+  if tokens.contains(name) {
+    tokens.remove(name)
+    save_named_config_object("mcp_tokens", tokens)
+  }
+  if options.json_mode {
+    let payload : Json = { "success": true, "name": name, "logged_in": false }
+    println(payload.stringify(indent=2))
+  } else {
+    println("MCP server '\{name}' logged out.")
   }
 }
 

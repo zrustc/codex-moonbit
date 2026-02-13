@@ -30,15 +30,29 @@ priv enum ParsedCommand {
   Exec(prompt~ : String, resume_id~ : String?)
   Review(prompt~ : String)
   Apply(path_or_patch~ : String?)
+  Completion(shell~ : String)
+  Sessions(all~ : Bool)
   Login(status~ : Bool, with_api_key~ : Bool)
   Logout
   McpList
   McpGet(name~ : String)
   McpAdd(name~ : String, url~ : String?, command~ : String?)
   McpRemove(name~ : String)
+  McpLogin(name~ : String, token~ : String?)
+  McpLogout(name~ : String)
   FeaturesList
   FeaturesEnable(name~ : String)
   FeaturesDisable(name~ : String)
+  CloudExec(
+    query~ : String,
+    environment~ : String?,
+    branch~ : String?,
+    attempts~ : Int
+  )
+  CloudStatus(task_id~ : String)
+  CloudList(limit~ : Int)
+  CloudApply(task_id~ : String, attempt~ : Int?)
+  CloudDiff(task_id~ : String, attempt~ : Int?)
   Fork(session_id~ : String, prompt~ : String)
   Sandbox(command~ : String)
 }
@@ -86,6 +100,13 @@ priv struct AgentRunResult {
 }
 
 ///|
+priv struct SessionSummary {
+  id : String
+  cwd : String
+  created_at_ms : String
+}
+
+///|
 fn[X] fatal(message : String) -> X {
   println("ERROR: \{message}")
   @sys.exit(1)
@@ -113,6 +134,8 @@ pub fn main_entry() -> Unit {
       run_exec_command(prompt, resume_id, parsed.options)
     Review(prompt~) => run_review_command(prompt, parsed.options)
     Apply(path_or_patch~) => run_apply_command(path_or_patch, parsed.options)
+    Completion(shell~) => run_completion_command(shell)
+    Sessions(all~) => run_sessions_command(all, parsed.options)
     Login(status~, with_api_key~) =>
       run_login_command(status, with_api_key, parsed.options)
     Logout => run_logout_command(parsed.options)
@@ -121,11 +144,28 @@ pub fn main_entry() -> Unit {
     McpAdd(name~, url~, command~) =>
       run_mcp_add_command(name, url, command, parsed.options)
     McpRemove(name~) => run_mcp_remove_command(name, parsed.options)
+    McpLogin(name~, token~) =>
+      run_mcp_login_command(name, token, parsed.options)
+    McpLogout(name~) => run_mcp_logout_command(name, parsed.options)
     FeaturesList => run_features_list_command(parsed.options)
     FeaturesEnable(name~) =>
       run_features_set_command(name, true, parsed.options)
     FeaturesDisable(name~) =>
       run_features_set_command(name, false, parsed.options)
+    CloudExec(query~, environment~, branch~, attempts~) =>
+      run_cloud_exec_command(
+        query,
+        environment,
+        branch,
+        attempts,
+        parsed.options,
+      )
+    CloudStatus(task_id~) => run_cloud_status_command(task_id, parsed.options)
+    CloudList(limit~) => run_cloud_list_command(limit, parsed.options)
+    CloudApply(task_id~, attempt~) =>
+      run_cloud_apply_command(task_id, attempt, parsed.options)
+    CloudDiff(task_id~, attempt~) =>
+      run_cloud_diff_command(task_id, attempt, parsed.options)
     Fork(session_id~, prompt~) =>
       run_fork_command(session_id, prompt, parsed.options)
     Sandbox(command~) => run_sandbox_command(command, parsed.options)
@@ -151,6 +191,28 @@ fn parse_int_or_default(value : String, fallback : Int) -> Int {
 }
 
 ///|
+fn clamp_cloud_attempts(value : Int) -> Int {
+  if value < 1 {
+    1
+  } else if value > 4 {
+    4
+  } else {
+    value
+  }
+}
+
+///|
+fn clamp_cloud_limit(value : Int) -> Int {
+  if value < 1 {
+    1
+  } else if value > 50 {
+    50
+  } else {
+    value
+  }
+}
+
+///|
 fn parse_cli(args : Array[String]) -> ParseResult {
   let mut model = DEFAULT_MODEL
   let mut base_url = match @sys.get_env_var("OPENAI_BASE_URL") {
@@ -162,8 +224,16 @@ fn parse_cli(args : Array[String]) -> ParseResult {
   let mut max_turns = DEFAULT_MAX_TURNS
   let mut json_mode = false
   let mut with_api_key = false
+  let mut flag_last = false
+  let mut flag_all = false
   let mut mcp_url : String? = None
   let mut mcp_command : String? = None
+  let mut mcp_token : String? = None
+  let mut cloud_env : String? = None
+  let mut cloud_branch : String? = None
+  let mut cloud_attempts = 1
+  let mut cloud_attempt : Int? = None
+  let mut cloud_limit = 20
   let mut parse_error : String? = None
   let mut want_help = false
   let mut want_version = false
@@ -180,6 +250,8 @@ fn parse_cli(args : Array[String]) -> ParseResult {
       "-V" | "--version" => want_version = true
       "--json" => json_mode = true
       "--with-api-key" => with_api_key = true
+      "--last" => flag_last = true
+      "--all" => flag_all = true
       "-m" | "--model" => {
         if i + 1 >= args.length() {
           parse_error = Some("missing value for --model")
@@ -225,6 +297,63 @@ fn parse_cli(args : Array[String]) -> ParseResult {
         skip_next = true
       }
       [.. "--command=", .. value] => mcp_command = Some(value.to_string())
+      "--token" => {
+        if i + 1 >= args.length() {
+          parse_error = Some("missing value for --token")
+          break
+        }
+        mcp_token = Some(args[i + 1])
+        skip_next = true
+      }
+      [.. "--token=", .. value] => mcp_token = Some(value.to_string())
+      "--env" => {
+        if i + 1 >= args.length() {
+          parse_error = Some("missing value for --env")
+          break
+        }
+        cloud_env = Some(args[i + 1])
+        skip_next = true
+      }
+      [.. "--env=", .. value] => cloud_env = Some(value.to_string())
+      "--branch" => {
+        if i + 1 >= args.length() {
+          parse_error = Some("missing value for --branch")
+          break
+        }
+        cloud_branch = Some(args[i + 1])
+        skip_next = true
+      }
+      [.. "--branch=", .. value] => cloud_branch = Some(value.to_string())
+      "--attempts" => {
+        if i + 1 >= args.length() {
+          parse_error = Some("missing value for --attempts")
+          break
+        }
+        cloud_attempts = parse_int_or_default(args[i + 1], 1)
+        skip_next = true
+      }
+      [.. "--attempts=", .. value] =>
+        cloud_attempts = parse_int_or_default(value.to_string(), 1)
+      "--attempt" => {
+        if i + 1 >= args.length() {
+          parse_error = Some("missing value for --attempt")
+          break
+        }
+        cloud_attempt = Some(parse_int_or_default(args[i + 1], 1))
+        skip_next = true
+      }
+      [.. "--attempt=", .. value] =>
+        cloud_attempt = Some(parse_int_or_default(value.to_string(), 1))
+      "--limit" => {
+        if i + 1 >= args.length() {
+          parse_error = Some("missing value for --limit")
+          break
+        }
+        cloud_limit = parse_int_or_default(args[i + 1], 20)
+        skip_next = true
+      }
+      [.. "--limit=", .. value] =>
+        cloud_limit = parse_int_or_default(value.to_string(), 20)
       "-C" | "--cwd" | "--cd" => {
         if i + 1 >= args.length() {
           parse_error = Some("missing value for --cwd")
@@ -293,45 +422,62 @@ fn parse_cli(args : Array[String]) -> ParseResult {
           error: None,
         }
       }
-    "resume" =>
-      if positionals.length() < 2 {
-        ParseResult::{
-          command: Help,
-          options,
-          error: Some("resume requires a session id"),
-        }
+    "resume" => {
+      let session_id = if positionals.length() > 1 {
+        Some(positionals[1])
+      } else if flag_last {
+        latest_session_id(options, flag_all)
       } else {
-        let session_id = positionals[1]
-        let prompt = if positionals.length() > 2 {
-          join_strings(positionals, 2)
-        } else {
-          "Continue from previous context."
-        }
-        ParseResult::{
-          command: Exec(prompt~, resume_id=Some(session_id)),
-          options,
-          error: None,
-        }
+        None
       }
-    "fork" =>
-      if positionals.length() < 2 {
-        ParseResult::{
-          command: Help,
-          options,
-          error: Some("fork requires a session id"),
-        }
+      let prompt = if positionals.length() > 2 {
+        join_strings(positionals, 2)
       } else {
-        let prompt = if positionals.length() > 2 {
-          join_strings(positionals, 2)
-        } else {
-          "Continue from forked context."
-        }
-        ParseResult::{
-          command: Fork(session_id=positionals[1], prompt~),
-          options,
-          error: None,
-        }
+        "Continue from previous context."
       }
+      match session_id {
+        Some(id) =>
+          ParseResult::{
+            command: Exec(prompt~, resume_id=Some(id)),
+            options,
+            error: None,
+          }
+        None =>
+          ParseResult::{
+            command: Help,
+            options,
+            error: Some("resume requires a session id or --last"),
+          }
+      }
+    }
+    "fork" => {
+      let session_id = if positionals.length() > 1 {
+        Some(positionals[1])
+      } else if flag_last {
+        latest_session_id(options, flag_all)
+      } else {
+        None
+      }
+      let prompt = if positionals.length() > 2 {
+        join_strings(positionals, 2)
+      } else {
+        "Continue from forked context."
+      }
+      match session_id {
+        Some(id) =>
+          ParseResult::{
+            command: Fork(session_id=id, prompt~),
+            options,
+            error: None,
+          }
+        None =>
+          ParseResult::{
+            command: Help,
+            options,
+            error: Some("fork requires a session id or --last"),
+          }
+      }
+    }
     "apply" => {
       let patch_arg = if positionals.length() > 1 {
         Some(join_strings(positionals, 1))
@@ -356,6 +502,12 @@ fn parse_cli(args : Array[String]) -> ParseResult {
         error: None,
       }
     }
+    "completion" => {
+      let shell = if positionals.length() > 1 { positionals[1] } else { "bash" }
+      ParseResult::{ command: Completion(shell~), options, error: None }
+    }
+    "sessions" =>
+      ParseResult::{ command: Sessions(all=flag_all), options, error: None }
     "login" =>
       if positionals.length() > 2 {
         ParseResult::{
@@ -385,7 +537,9 @@ fn parse_cli(args : Array[String]) -> ParseResult {
         ParseResult::{
           command: Help,
           options,
-          error: Some("mcp requires a subcommand: list|get|add|remove"),
+          error: Some(
+            "mcp requires a subcommand: list|get|add|remove|login|logout",
+          ),
         }
       } else {
         match positionals[1] {
@@ -453,6 +607,34 @@ fn parse_cli(args : Array[String]) -> ParseResult {
             } else {
               ParseResult::{
                 command: McpRemove(name=positionals[2]),
+                options,
+                error: None,
+              }
+            }
+          "login" =>
+            if positionals.length() < 3 {
+              ParseResult::{
+                command: Help,
+                options,
+                error: Some("mcp login requires a server name"),
+              }
+            } else {
+              ParseResult::{
+                command: McpLogin(name=positionals[2], token=mcp_token),
+                options,
+                error: None,
+              }
+            }
+          "logout" =>
+            if positionals.length() < 3 {
+              ParseResult::{
+                command: Help,
+                options,
+                error: Some("mcp logout requires a server name"),
+              }
+            } else {
+              ParseResult::{
+                command: McpLogout(name=positionals[2]),
                 options,
                 error: None,
               }
@@ -543,12 +725,94 @@ fn parse_cli(args : Array[String]) -> ParseResult {
         }
       }
     "cloud" =>
-      ParseResult::{
-        command: Help,
-        options,
-        error: Some(
-          "subcommand '\{first}' is not implemented yet in codex-moonbit",
-        ),
+      if positionals.length() == 1 {
+        ParseResult::{
+          command: CloudList(limit=clamp_cloud_limit(cloud_limit)),
+          options,
+          error: None,
+        }
+      } else {
+        match positionals[1] {
+          "exec" =>
+            if positionals.length() < 3 {
+              ParseResult::{
+                command: Help,
+                options,
+                error: Some("cloud exec requires a query"),
+              }
+            } else {
+              ParseResult::{
+                command: CloudExec(
+                  query=join_strings(positionals, 2),
+                  environment=cloud_env,
+                  branch=cloud_branch,
+                  attempts=clamp_cloud_attempts(cloud_attempts),
+                ),
+                options,
+                error: None,
+              }
+            }
+          "status" =>
+            if positionals.length() < 3 {
+              ParseResult::{
+                command: Help,
+                options,
+                error: Some("cloud status requires a task id"),
+              }
+            } else {
+              ParseResult::{
+                command: CloudStatus(task_id=positionals[2]),
+                options,
+                error: None,
+              }
+            }
+          "list" =>
+            ParseResult::{
+              command: CloudList(limit=clamp_cloud_limit(cloud_limit)),
+              options,
+              error: None,
+            }
+          "apply" =>
+            if positionals.length() < 3 {
+              ParseResult::{
+                command: Help,
+                options,
+                error: Some("cloud apply requires a task id"),
+              }
+            } else {
+              ParseResult::{
+                command: CloudApply(
+                  task_id=positionals[2],
+                  attempt=cloud_attempt,
+                ),
+                options,
+                error: None,
+              }
+            }
+          "diff" =>
+            if positionals.length() < 3 {
+              ParseResult::{
+                command: Help,
+                options,
+                error: Some("cloud diff requires a task id"),
+              }
+            } else {
+              ParseResult::{
+                command: CloudDiff(
+                  task_id=positionals[2],
+                  attempt=cloud_attempt,
+                ),
+                options,
+                error: None,
+              }
+            }
+          _ =>
+            ParseResult::{
+              command: Help,
+              options,
+              error: Some("unknown cloud subcommand: \{positionals[1]}"),
+            }
+        }
       }
     _ =>
       ParseResult::{
@@ -568,11 +832,14 @@ fn print_help() -> Unit {
   println("  codex [OPTIONS] exec <PROMPT>")
   println("  codex [OPTIONS] resume <SESSION_ID> [PROMPT]")
   println("  codex [OPTIONS] fork <SESSION_ID> [PROMPT]")
+  println("  codex [OPTIONS] sessions [--all]")
   println("  codex [OPTIONS] review [TARGET]")
   println("  codex [OPTIONS] apply [PATCH_FILE]")
+  println("  codex completion [bash|zsh|fish]")
   println("  codex login [status] [--with-api-key] [--api-key <KEY>]")
   println("  codex logout")
-  println("  codex mcp list|get|add|remove ...")
+  println("  codex mcp list|get|add|remove|login|logout ...")
+  println("  codex cloud exec|status|list|apply|diff ...")
   println("  codex features list|enable|disable ...")
   println("  codex sandbox [linux|macos|windows] <COMMAND>")
   println("")
@@ -585,6 +852,14 @@ fn print_help() -> Unit {
   )
   println("      --url <URL>                MCP add: streamable HTTP URL")
   println("      --command <CMD>            MCP add: launcher command")
+  println("      --token <TOKEN>            MCP login: store access token")
+  println("      --env <ENV_ID>             Cloud exec: environment id")
+  println("      --branch <BRANCH>          Cloud exec: branch name")
+  println("      --attempts <N>             Cloud exec: attempts (1-4)")
+  println("      --attempt <N>              Cloud apply/diff: attempt number")
+  println("      --limit <N>                Cloud list: max returned tasks")
+  println("      --last                     Resume/fork the latest session")
+  println("      --all                      Include sessions from all cwd")
   println("  -C, --cwd <DIR>                Working directory")
   println("      --max-turns <N>            Max tool-call turns")
   println("      --json                     Print final result as JSON")
@@ -697,6 +972,11 @@ fn session_file_path(session_id : String) -> String {
 }
 
 ///|
+fn sessions_dir_path() -> String {
+  path_join(ensure_storage_dirs(), "sessions")
+}
+
+///|
 fn save_latest_patch(patch : String) -> Unit {
   let base = ensure_storage_dirs()
   let path = path_join(base, "latest.patch")
@@ -752,6 +1032,105 @@ fn load_session_messages(session_id : String) -> Array[Json]? {
 }
 
 ///|
+fn parse_session_summary(
+  session_file_abs_path : String,
+  fallback_id : String,
+) -> SessionSummary? {
+  let content = @fs.read_file_to_string(session_file_abs_path) catch {
+    _ => return None
+  }
+  let parsed = @json.parse(content) catch { _ => return None }
+  guard parsed is Object(obj) else { return None }
+  let id = match obj.get("id") {
+    Some(String(value)) => value
+    _ => fallback_id
+  }
+  let cwd = match obj.get("cwd") {
+    Some(String(value)) => value
+    _ => ""
+  }
+  let created_at_ms = match obj.get("created_at_ms") {
+    Some(String(value)) => value
+    Some(Number(value, ..)) => "\{value.to_int()}"
+    _ => "0"
+  }
+  Some(SessionSummary::{ id, cwd, created_at_ms })
+}
+
+///|
+fn list_session_summaries(
+  options : RunOptions,
+  all : Bool,
+) -> Array[SessionSummary] {
+  let sessions_dir = sessions_dir_path()
+  let names = @fs.read_dir(sessions_dir) catch { _ => [] }
+  let selected : Array[SessionSummary] = []
+  let root_cwd = tool_root_dir(options)
+  for name in names {
+    if !name.has_suffix(".json") {
+      continue
+    }
+    let fallback_id = (try! name[:name.length() - 5]).to_string()
+    let path = path_join(sessions_dir, name)
+    let summary = match parse_session_summary(path, fallback_id) {
+      Some(value) => value
+      None => continue
+    }
+    if !all {
+      let session_cwd = to_absolute_path(default_cwd(), summary.cwd)
+      if session_cwd != root_cwd {
+        continue
+      }
+    }
+    selected.push(summary)
+  }
+  selected.sort_by((a, b) => if a.created_at_ms > b.created_at_ms {
+    -1
+  } else if a.created_at_ms < b.created_at_ms {
+    1
+  } else if a.id > b.id {
+    -1
+  } else if a.id < b.id {
+    1
+  } else {
+    0
+  })
+  selected
+}
+
+///|
+fn latest_session_id(options : RunOptions, all : Bool) -> String? {
+  let sessions = list_session_summaries(options, all)
+  if sessions.is_empty() {
+    None
+  } else {
+    Some(sessions[0].id)
+  }
+}
+
+///|
+fn run_sessions_command(all : Bool, options : RunOptions) -> Unit {
+  let sessions = list_session_summaries(options, all)
+  if options.json_mode {
+    let rows : Array[Json] = sessions.map(s => {
+      "id": s.id,
+      "cwd": s.cwd,
+      "created_at_ms": s.created_at_ms,
+    })
+    let payload : Json = { "sessions": rows }
+    println(payload.stringify(indent=2))
+    return
+  }
+  if sessions.is_empty() {
+    println("No sessions found.")
+    return
+  }
+  for s in sessions {
+    println("\{s.id}\t\{s.cwd}\t\{s.created_at_ms}")
+  }
+}
+
+///|
 fn run_apply_command(path_or_patch : String?, options : RunOptions) -> Unit {
   let patch_text = match path_or_patch {
     Some(value) =>
@@ -797,6 +1176,60 @@ fn build_review_prompt(target : String) -> String {
 ///|
 fn run_review_command(prompt : String, options : RunOptions) -> Unit {
   run_exec_command(prompt, None, options)
+}
+
+///|
+fn run_completion_command(shell : String) -> Unit {
+  match shell.trim().to_string() {
+    "bash" => {
+      let script =
+        #|_codex_complete() {
+        #|  local cur prev words cword
+        #|  _init_completion || return
+        #|  local commands="exec e review resume fork apply login logout mcp features sandbox sessions completion help version"
+        #|  COMPREPLY=( $(compgen -W "${commands}" -- "$cur") )
+        #|}
+        #|complete -F _codex_complete codex
+        #|
+      println(script)
+    }
+    "zsh" => {
+      let script =
+        #|#compdef codex
+        #|_codex_complete() {
+        #|  local -a commands
+        #|  commands=(
+        #|    "exec"
+        #|    "e"
+        #|    "review"
+        #|    "resume"
+        #|    "fork"
+        #|    "apply"
+        #|    "login"
+        #|    "logout"
+        #|    "mcp"
+        #|    "features"
+        #|    "sandbox"
+        #|    "sessions"
+        #|    "completion"
+        #|    "help"
+        #|    "version"
+        #|  )
+        #|  _describe 'command' commands
+        #|}
+        #|compdef _codex_complete codex
+        #|
+      println(script)
+    }
+    "fish" => {
+      let script =
+        #|complete -c codex -f
+        #|complete -c codex -n "__fish_use_subcommand" -a "exec e review resume fork apply login logout mcp features sandbox sessions completion help version"
+        #|
+      println(script)
+    }
+    _ => fatal("unsupported shell for completion: \{shell}")
+  }
 }
 
 ///|
