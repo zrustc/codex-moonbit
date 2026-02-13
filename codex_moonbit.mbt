@@ -28,6 +28,7 @@ priv enum ParsedCommand {
   Help
   Version
   Exec(prompt~ : String, resume_id~ : String?)
+  Review(prompt~ : String)
   Apply(path_or_patch~ : String?)
   Login(status~ : Bool, with_api_key~ : Bool)
   Logout
@@ -109,6 +110,7 @@ pub fn main_entry() -> Unit {
     Version => println("codex-moonbit \{VERSION}")
     Exec(prompt~, resume_id~) =>
       run_exec_command(prompt, resume_id, parsed.options)
+    Review(prompt~) => run_review_command(prompt, parsed.options)
     Apply(path_or_patch~) => run_apply_command(path_or_patch, parsed.options)
     Login(status~, with_api_key~) =>
       run_login_command(status, with_api_key, parsed.options)
@@ -340,6 +342,18 @@ fn parse_cli(args : Array[String]) -> ParseResult {
         error: None,
       }
     }
+    "review" => {
+      let review_target = if positionals.length() > 1 {
+        join_strings(positionals, 1)
+      } else {
+        "current changes"
+      }
+      ParseResult::{
+        command: Review(prompt=build_review_prompt(review_target)),
+        options,
+        error: None,
+      }
+    }
     "login" =>
       if positionals.length() > 2 {
         ParseResult::{
@@ -495,7 +509,7 @@ fn parse_cli(args : Array[String]) -> ParseResult {
             }
         }
       }
-    "cloud" | "sandbox" | "review" =>
+    "cloud" | "sandbox" =>
       ParseResult::{
         command: Help,
         options,
@@ -521,6 +535,7 @@ fn print_help() -> Unit {
   println("  codex [OPTIONS] exec <PROMPT>")
   println("  codex [OPTIONS] resume <SESSION_ID> [PROMPT]")
   println("  codex [OPTIONS] fork <SESSION_ID> [PROMPT]")
+  println("  codex [OPTIONS] review [TARGET]")
   println("  codex [OPTIONS] apply [PATCH_FILE]")
   println("  codex login [status] [--with-api-key] [--api-key <KEY>]")
   println("  codex logout")
@@ -706,12 +721,16 @@ fn load_session_messages(session_id : String) -> Array[Json]? {
 fn run_apply_command(path_or_patch : String?, options : RunOptions) -> Unit {
   let patch_text = match path_or_patch {
     Some(value) =>
-      if @fs.path_exists(value) {
-        @fs.read_file_to_string(value) catch {
-          _ => fatal("failed to read patch file: \{value}")
-        }
-      } else {
-        value
+      match resolve_tool_path(value, options) {
+        Some(path) =>
+          if @fs.path_exists(path) {
+            @fs.read_file_to_string(path) catch {
+              _ => fatal("failed to read patch file: \{path}")
+            }
+          } else {
+            value
+          }
+        None => fatal("patch file path escapes working directory: \{value}")
       }
     None =>
       match load_latest_patch() {
@@ -721,6 +740,29 @@ fn run_apply_command(path_or_patch : String?, options : RunOptions) -> Unit {
   }
   let output = apply_patch_tool(patch_text, options)
   println(output)
+}
+
+///|
+fn build_review_prompt(target : String) -> String {
+  let scope = if target.trim().to_string() == "" {
+    "current changes"
+  } else {
+    target.trim().to_string()
+  }
+  let prompt =
+    $|Please perform a strict code review for \{scope}.
+    $|Return:
+    $|1) Findings ordered by severity
+    $|2) Concrete file/line references
+    $|3) Regressions and missing tests
+    $|4) A short risk summary
+    $|
+  prompt
+}
+
+///|
+fn run_review_command(prompt : String, options : RunOptions) -> Unit {
+  run_exec_command(prompt, None, options)
 }
 
 ///|
@@ -846,7 +888,7 @@ fn tool_schema() -> Array[Json] {
       "type": "function",
       "function": {
         "name": "list_files",
-        "description": "List files using rg --files.",
+        "description": "List files recursively from a path within the workspace.",
         "parameters": {
           "type": "object",
           "properties": { "path": { "type": "string" } },
@@ -909,7 +951,7 @@ fn chat_completion(messages : Array[Json], options : RunOptions) -> Json? {
       "--data-binary",
       "@\{request_path}",
     ],
-    Some(options.cwd),
+    Some(tool_root_dir(options)),
   )
   @fs.remove_file(request_path) catch {
     _ => ()
@@ -1004,8 +1046,201 @@ fn json_get_string(obj : Map[String, Json], key : String) -> String? {
 }
 
 ///|
-fn resolve_tool_path(path : String, options : RunOptions) -> String {
-  path_join(options.cwd, path)
+fn path_is_absolute(path : String) -> Bool {
+  path.has_prefix("/")
+}
+
+///|
+fn normalize_path(path : String) -> String {
+  let absolute = path_is_absolute(path)
+  let parts : Array[String] = []
+  for raw in path.split("/") {
+    let part = raw.to_string()
+    if part == "" || part == "." {
+      continue
+    }
+    if part == ".." {
+      if absolute {
+        if !parts.is_empty() {
+          ignore(parts.pop())
+        }
+      } else {
+        match parts.last() {
+          Some(last) =>
+            if last == ".." {
+              parts.push("..")
+            } else {
+              ignore(parts.pop())
+            }
+          None => parts.push("..")
+        }
+      }
+      continue
+    }
+    parts.push(part)
+  }
+  if parts.is_empty() {
+    if absolute {
+      "/"
+    } else {
+      "."
+    }
+  } else {
+    let joined = parts.join("/")
+    if absolute {
+      "/" + joined
+    } else {
+      joined
+    }
+  }
+}
+
+///|
+fn to_absolute_path(base : String, path : String) -> String {
+  if path_is_absolute(path) {
+    normalize_path(path)
+  } else {
+    normalize_path(path_join(base, path))
+  }
+}
+
+///|
+fn tool_root_dir(options : RunOptions) -> String {
+  to_absolute_path(default_cwd(), options.cwd)
+}
+
+///|
+fn is_path_within_root(root_abs : String, candidate_abs : String) -> Bool {
+  if root_abs == "/" {
+    candidate_abs.has_prefix("/")
+  } else {
+    candidate_abs == root_abs || candidate_abs.has_prefix(root_abs + "/")
+  }
+}
+
+///|
+fn resolve_tool_path(path : String, options : RunOptions) -> String? {
+  let root_abs = tool_root_dir(options)
+  let candidate_abs = to_absolute_path(root_abs, path)
+  if is_path_within_root(root_abs, candidate_abs) {
+    Some(candidate_abs)
+  } else {
+    None
+  }
+}
+
+///|
+fn path_relative_to(root_abs : String, candidate_abs : String) -> String? {
+  if !is_path_within_root(root_abs, candidate_abs) {
+    return None
+  }
+  if candidate_abs == root_abs {
+    return Some(".")
+  }
+  if root_abs == "/" {
+    return Some((try! candidate_abs[1:]).to_string())
+  }
+  let prefix = root_abs + "/"
+  if candidate_abs.has_prefix(prefix) {
+    Some((try! candidate_abs[prefix.length():]).to_string())
+  } else {
+    None
+  }
+}
+
+///|
+fn should_skip_walk_dir(name : String) -> Bool {
+  name == ".git" ||
+  name == ".hg" ||
+  name == ".svn" ||
+  name == "_build" ||
+  name == ".mooncakes" ||
+  name == "node_modules" ||
+  name == "target"
+}
+
+///|
+const MAX_LIST_FILES = 5000
+
+///|
+const MAX_LIST_DEPTH = 16
+
+///|
+fn collect_files_recursive(
+  root_abs : String,
+  rel_dir : String,
+  depth : Int,
+  out : Array[String],
+) -> Unit {
+  if depth > MAX_LIST_DEPTH || out.length() >= MAX_LIST_FILES {
+    return
+  }
+  let current_dir = if rel_dir == "" {
+    root_abs
+  } else {
+    path_join(root_abs, rel_dir)
+  }
+  let entries = @fs.read_dir(current_dir) catch { _ => [] }
+  entries.sort()
+  for name in entries {
+    if name == "." || name == ".." {
+      continue
+    }
+    let child_rel = if rel_dir == "" { name } else { rel_dir + "/" + name }
+    let child_abs = path_join(root_abs, child_rel)
+    let is_dir = @fs.is_dir(child_abs) catch { _ => false }
+    if is_dir {
+      if should_skip_walk_dir(name) {
+        continue
+      }
+      collect_files_recursive(root_abs, child_rel, depth + 1, out)
+      if out.length() >= MAX_LIST_FILES {
+        return
+      }
+      continue
+    }
+    let is_file = @fs.is_file(child_abs) catch { _ => false }
+    if is_file {
+      out.push(child_rel)
+      if out.length() >= MAX_LIST_FILES {
+        return
+      }
+    }
+  }
+}
+
+///|
+fn list_files_under_path(
+  path : String,
+  options : RunOptions,
+) -> Result[Array[String], String] {
+  let root_abs = tool_root_dir(options)
+  let target_abs = match resolve_tool_path(path, options) {
+    Some(value) => value
+    None => return Err("path escapes working directory: \{path}")
+  }
+  let target_is_dir = @fs.is_dir(target_abs) catch { _ => false }
+  if target_is_dir {
+    let start_rel = match path_relative_to(root_abs, target_abs) {
+      Some(".") => ""
+      Some(value) => value
+      None => return Err("path escapes working directory: \{path}")
+    }
+    let files : Array[String] = []
+    collect_files_recursive(root_abs, start_rel, 0, files)
+    files.sort()
+    Ok(files)
+  } else {
+    let target_is_file = @fs.is_file(target_abs) catch { _ => false }
+    if !target_is_file {
+      return Err("path does not exist: \{path}")
+    }
+    let rel = match path_relative_to(root_abs, target_abs) {
+      Some(value) => value
+      None => return Err("path escapes working directory: \{path}")
+    }
+    Ok([rel])
+  }
 }
 
 ///|
@@ -1031,7 +1266,7 @@ fn apply_patch_tool(patch : String, options : RunOptions) -> String {
   let result = run_process_capture(
     "git",
     ["apply", "--whitespace=nowarn", patch_path],
-    Some(options.cwd),
+    Some(tool_root_dir(options)),
   )
   @fs.remove_file(patch_path) catch {
     _ => ()
@@ -1059,8 +1294,18 @@ fn tool_exec_command(arguments : Json, options : RunOptions) -> ToolResult {
     }
   }
   let command_cwd = match json_get_string(obj, "cwd") {
-    Some(path) => Some(resolve_tool_path(path, options))
-    None => Some(options.cwd)
+    Some(path) =>
+      match resolve_tool_path(path, options) {
+        Some(resolved) => Some(resolved)
+        None => {
+          let err : Json = {
+            "error": "cwd escapes working directory",
+            "cwd": path,
+          }
+          return ToolResult::{ content: err.stringify(), latest_patch: None }
+        }
+      }
+    None => Some(tool_root_dir(options))
   }
   let result = run_process_capture("bash", ["-lc", cmd], command_cwd)
   let payload : Json = {
@@ -1079,7 +1324,14 @@ fn tool_read_file(arguments : Json, options : RunOptions) -> ToolResult {
     return ToolResult::{ content: err.stringify(), latest_patch: None }
   }
   let path = match json_get_string(obj, "path") {
-    Some(path) => resolve_tool_path(path, options)
+    Some(path) =>
+      match resolve_tool_path(path, options) {
+        Some(resolved) => resolved
+        None => {
+          let err : Json = { "error": "path escapes working directory" }
+          return ToolResult::{ content: err.stringify(), latest_patch: None }
+        }
+      }
     None => {
       let err : Json = { "error": "missing path" }
       return ToolResult::{ content: err.stringify(), latest_patch: None }
@@ -1102,7 +1354,14 @@ fn tool_write_file(arguments : Json, options : RunOptions) -> ToolResult {
     return ToolResult::{ content: err.stringify(), latest_patch: None }
   }
   let path = match json_get_string(obj, "path") {
-    Some(path) => resolve_tool_path(path, options)
+    Some(path) =>
+      match resolve_tool_path(path, options) {
+        Some(resolved) => resolved
+        None => {
+          let err : Json = { "error": "path escapes working directory" }
+          return ToolResult::{ content: err.stringify(), latest_patch: None }
+        }
+      }
     None => {
       let err : Json = { "error": "missing path" }
       return ToolResult::{ content: err.stringify(), latest_patch: None }
@@ -1139,26 +1398,21 @@ fn tool_list_files(arguments : Json, options : RunOptions) -> ToolResult {
       }
     _ => "."
   }
-  let rg_result = run_process_capture(
-    "rg",
-    ["--files", path],
-    Some(options.cwd),
-  )
-  let result = if rg_result.status == 0 {
-    rg_result
-  } else {
-    run_process_capture(
-      "find",
-      [path, "-maxdepth", "4", "-type", "f"],
-      Some(options.cwd),
-    )
+  let listed = list_files_under_path(path, options)
+  match listed {
+    Err(error) => {
+      let payload : Json = { "status": 1, "stdout": "", "stderr": error }
+      return ToolResult::{ content: payload.stringify(), latest_patch: None }
+    }
+    Ok(files) => {
+      let payload : Json = {
+        "status": 0,
+        "stdout": files.join("\n"),
+        "stderr": "",
+      }
+      return ToolResult::{ content: payload.stringify(), latest_patch: None }
+    }
   }
-  let payload : Json = {
-    "status": result.status,
-    "stdout": result.stdout,
-    "stderr": result.stderr,
-  }
-  ToolResult::{ content: payload.stringify(), latest_patch: None }
 }
 
 ///|
