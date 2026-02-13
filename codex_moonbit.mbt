@@ -40,6 +40,7 @@ priv enum ParsedCommand {
   FeaturesEnable(name~ : String)
   FeaturesDisable(name~ : String)
   Fork(session_id~ : String, prompt~ : String)
+  Sandbox(command~ : String)
 }
 
 ///|
@@ -127,6 +128,7 @@ pub fn main_entry() -> Unit {
       run_features_set_command(name, false, parsed.options)
     Fork(session_id~, prompt~) =>
       run_fork_command(session_id, prompt, parsed.options)
+    Sandbox(command~) => run_sandbox_command(command, parsed.options)
   }
 }
 
@@ -509,7 +511,38 @@ fn parse_cli(args : Array[String]) -> ParseResult {
             }
         }
       }
-    "cloud" | "sandbox" =>
+    "sandbox" =>
+      if positionals.length() < 2 {
+        ParseResult::{
+          command: Help,
+          options,
+          error: Some("sandbox requires a command to run"),
+        }
+      } else {
+        match positionals[1] {
+          "linux" | "macos" | "windows" =>
+            if positionals.length() < 3 {
+              ParseResult::{
+                command: Help,
+                options,
+                error: Some("sandbox \{positionals[1]} requires a command"),
+              }
+            } else {
+              ParseResult::{
+                command: Sandbox(command=join_strings(positionals, 2)),
+                options,
+                error: None,
+              }
+            }
+          _ =>
+            ParseResult::{
+              command: Sandbox(command=join_strings(positionals, 1)),
+              options,
+              error: None,
+            }
+        }
+      }
+    "cloud" =>
       ParseResult::{
         command: Help,
         options,
@@ -541,6 +574,7 @@ fn print_help() -> Unit {
   println("  codex logout")
   println("  codex mcp list|get|add|remove ...")
   println("  codex features list|enable|disable ...")
+  println("  codex sandbox [linux|macos|windows] <COMMAND>")
   println("")
   println("Options:")
   println("  -m, --model <MODEL>            Model name (default: gpt-5)")
@@ -763,6 +797,34 @@ fn build_review_prompt(target : String) -> String {
 ///|
 fn run_review_command(prompt : String, options : RunOptions) -> Unit {
   run_exec_command(prompt, None, options)
+}
+
+///|
+fn run_sandbox_command(command : String, options : RunOptions) -> Unit {
+  let result = run_process_capture(
+    "bash",
+    ["-lc", command],
+    Some(tool_root_dir(options)),
+  )
+  if options.json_mode {
+    let payload : Json = {
+      "status": result.status,
+      "success": result.status == 0,
+      "stdout": result.stdout,
+      "stderr": result.stderr,
+    }
+    println(payload.stringify(indent=2))
+  } else {
+    if result.stdout != "" {
+      println(result.stdout)
+    }
+    if result.stderr != "" {
+      println(result.stderr)
+    }
+    if result.status != 0 {
+      println("sandbox command exited with status \{result.status}")
+    }
+  }
 }
 
 ///|

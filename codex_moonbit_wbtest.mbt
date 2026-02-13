@@ -53,3 +53,25 @@ test "list_files_under_path walks with moonbit fs" {
   let escaped = list_files_under_path("../", options)
   assert_true(escaped is Err(_))
 }
+
+///|
+test "parse review and sandbox commands" {
+  let review = parse_cli(["review", "src/app.mbt"])
+  assert_true(review.error is None)
+  guard review.command is Review(prompt~) else {
+    fail("expected review command")
+  }
+  assert_true(prompt.contains("src/app.mbt"))
+  let sandbox = parse_cli(["sandbox", "echo", "hello"])
+  assert_true(sandbox.error is None)
+  guard sandbox.command is Sandbox(command~) else {
+    fail("expected sandbox command")
+  }
+  assert_eq(command, "echo hello")
+  let sandbox_linux = parse_cli(["sandbox", "linux", "echo", "ok"])
+  assert_true(sandbox_linux.error is None)
+  guard sandbox_linux.command is Sandbox(command=linux_command) else {
+    fail("expected sandbox command")
+  }
+  assert_eq(linux_command, "echo ok")
+}
